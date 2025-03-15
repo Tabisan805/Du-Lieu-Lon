@@ -1,0 +1,544 @@
+#############################
+# 0. Setup & Load Dữ liệu
+#############################
+library(sparklyr)
+library(dplyr)
+library(ggplot2)
+library(naniar)
+library(gridExtra)
+library(ggExtra)
+library(viridis)
+library(reshape2)
+library(GGally)
+library(caret)
+library(pROC)
+library(caret)
+library(class)
+library(xgboost)
+# Kết nối Spark
+sc <- spark_connect(master = "local")
+
+# Đọc dữ liệu từ CSV vào Spark DataFrame
+file_path <- "Shuffled_Placement_Data.csv"
+placement <- spark_read_csv(sc, name = "placement", 
+                            path = file_path, 
+                            header = TRUE, 
+                            infer_schema = TRUE)
+
+# Kiểm tra thông tin tệp
+print(paste("Tên tệp:", file_path))
+print(paste("Kích thước (KB):", round(file.info(file_path)$size / 1024, 2)))
+
+# Xem thông tin dữ liệu
+print(sdf_dim(placement))
+print(sdf_schema(placement))
+print(sdf_describe(placement))
+
+#############################
+# 1. Tiền xử lý dữ liệu
+#############################
+# Loại bỏ các cột không cần thiết và chuyển đổi kiểu dữ liệu
+placement_copy <- placement %>% 
+  select(-sl_no, -ssc_b, -hsc_b) %>%
+  mutate(
+    workex = as.double(ifelse(workex == "Yes", 1, 0)),
+    degree_p = as.double(degree_p),
+    salary = ifelse(is.na(salary), 0, salary),
+    status = as.integer(ifelse(status == "Placed", 1, 0))
+  )
+
+# Kiểm tra và xử lý missing values
+missing_values <- placement_copy %>% sdf_collect() %>% summarise_all(~sum(is.na(.)))
+print("Data columns with null values:")
+print(missing_values)
+
+# Thu thập dữ liệu về R để xử lý missing (với các giá trị NaN)
+placement_copy <- placement_copy %>% sdf_collect()
+placement_copy$degree_p[is.na(placement_copy$degree_p)] <- mean(placement_copy$degree_p, na.rm = TRUE)
+placement_copy$workex[is.na(placement_copy$workex)] <- 0
+# Đưa lại dữ liệu sau tiền xử lý lên Spark nếu cần thiết cho mô hình
+placement_copy <- sdf_copy_to(sc, placement_copy, "placement_copy", overwrite = TRUE)
+
+#############################
+# 2. Trực quan hóa dữ liệu
+#############################
+# --- Hiển thị missing values ---
+placement_missing <- placement %>% sdf_collect()
+gg_miss_var(placement_missing) + 
+  labs(title = "Biểu đồ hiển thị giá trị thiếu trong dữ liệu")
+
+# --- Biểu đồ danh mục ---
+placement_filtered <- placement_copy %>% sdf_collect()
+
+category_vars <- c("specialisation", "workex", "degree_t", "gender", "hsc_s", "status")
+category_titles <- c("Specialisation", "Work Experience", "Degree Type", "Gender", "Higher Secondary Specialisation", "Recruitment Status")
+fill_colors <- c("magma", "cividis", "viridis", "hot", "rocket", "copper")
+
+
+# Định nghĩa các palette hợp lệ mà bạn muốn sử dụng
+fill_colors <- c("magma", "cividis", "viridis", "plasma", "inferno", "viridis")
+
+plots <- lapply(1:length(category_vars), function(i) {
+  ggplot(placement_filtered, aes_string(x = category_vars[i])) +
+    geom_bar(fill = scales::alpha(viridis(1, option = fill_colors[i]), 0.7), color = "black") +
+    theme_minimal() +
+    labs(title = category_titles[i], x = category_titles[i], y = "Count") +
+    theme(axis.text.x = element_text(angle = 20, hjust = 1))
+})
+
+grid.arrange(grobs = plots, ncol = 3)
+
+
+# --- Boxplots cho các chỉ số phần trăm ---
+placement_df <- placement_copy %>% sdf_collect()
+
+# Reset layout & các thông số đồ họa
+tryCatch({ graphics.off() }, error = function(e) { })
+par(mfrow = c(1,1))
+options(repr.plot.width = 12, repr.plot.height = 8)
+par(mar = c(2,2,1,1))
+
+boxplot(placement_df$ssc_p, main = "Secondary school percentage", col = "lightblue")
+boxplot(placement_df$hsc_p, main = "Higher Secondary school percentage", col = "lightgreen")
+boxplot(placement_df$degree_p, main = "UG Degree percentage", col = "lightcoral")
+boxplot(placement_df$etest_p, main = "Employability percentage", col = "lightgoldenrod")
+
+# --- Loại bỏ outliers khỏi cột 'hsc_p' ---
+hsc_p_q1 <- quantile(placement_df$hsc_p, 0.25, na.rm = TRUE)
+hsc_p_q3 <- quantile(placement_df$hsc_p, 0.75, na.rm = TRUE)
+hsc_p_iqr <- hsc_p_q3 - hsc_p_q1
+
+placement_filtered <- placement_df[placement_df$hsc_p >= (hsc_p_q1 - 1.5 * hsc_p_iqr) &
+                                     placement_df$hsc_p <= (hsc_p_q3 + 1.5 * hsc_p_iqr), ]
+
+# Vẽ boxplot trước & sau khi loại bỏ outliers
+tryCatch({ graphics.off() }, error = function(e) { })
+par(mfrow = c(1,1))
+options(repr.plot.width = 12, repr.plot.height = 8)
+par(mar = c(2,2,1,1))
+
+boxplot(placement_df$hsc_p, main = "Before removing outliers (hsc_p)", col = "lightblue")
+boxplot(placement_filtered$hsc_p, main = "After removing outliers (hsc_p)", col = "lightgreen")
+
+# --- Biểu đồ danh mục (phiên bản khác) ---
+plot_list <- list()
+for (i in 1:length(category_vars)) {
+  plot_list[[i]] <- ggplot(placement_filtered, aes(.data[[category_vars[i]]])) +
+    geom_bar(aes(fill = ..count..), color = "black") +
+    scale_fill_gradient(low = "#ece7f2", high = "#2b8cbe") +
+    theme_minimal() +
+    labs(title = category_titles[i], x = category_titles[i], y = "Count") +
+    theme(axis.text.x = element_text(angle = 20, hjust = 1))
+}
+grid.arrange(grobs = plot_list, ncol = 3)
+
+# --- Boxplot & Histogram cho cột salary ---
+# Lọc dữ liệu chỉ những sinh viên có salary > 0
+placement_placed <- placement_filtered %>% filter(salary > 0)
+
+boxplot_salary <- ggplot(placement_placed, aes(x = salary)) +
+  geom_boxplot(fill = "#2b8cbe", color = "black") +
+  theme_minimal() +
+  labs(title = "Salary Distribution - Boxplot", x = "Salary")
+
+hist_salary <- ggplot(placement_placed, aes(x = salary)) +
+  geom_histogram(fill = "#2b8cbe", color = "black", bins = 30) +
+  theme_minimal() +
+  labs(title = "Salary Distribution - Histogram", x = "Salary", y = "Count")
+
+grid.arrange(boxplot_salary, hist_salary, ncol = 1, heights = c(1, 3))
+
+# --- Joint Plot (scatter + density contours) cho etest_p vs salary ---
+joint_plot <- ggplot(placement_filtered, aes(x = etest_p, y = salary)) +
+  geom_point(alpha = 0.5, color = "skyblue") +
+  geom_density_2d(color = "blue") +
+  theme_minimal() +
+  labs(title = "Joint Plot of E-Test Percentage vs Salary", x = "E-Test Percentage", y = "Salary")
+ggMarginal(joint_plot, type = "density", fill = "skyblue")
+
+# --- Các biểu đồ phân bố (density plots) ---
+dist_vars <- c("ssc_p", "hsc_p", "degree_p", "etest_p", "mba_p", "salary")
+dist_titles <- c("SSC Percentage", "HSC Percentage", "Degree Percentage", "E-Test Percentage", "MBA Percentage", "Salary Distribution")
+dist_plots <- list()
+for (i in 1:length(dist_vars)) {
+  dist_plots[[i]] <- ggplot(placement_filtered, aes(x = .data[[dist_vars[i]]])) +
+    geom_density(fill = "skyblue", alpha = 0.5) +
+    theme_minimal() +
+    labs(title = dist_titles[i], x = dist_titles[i], y = "Density")
+}
+grid.arrange(grobs = dist_plots, ncol = 3)
+
+# --- Biểu đồ tròn & cột cho Work Experience ---
+workex_pie <- placement_filtered %>%
+  count(workex) %>%
+  ggplot(aes(x = "", y = n, fill = workex)) +
+  geom_bar(stat = "identity", width = 1, color = "black") +
+  coord_polar(theta = "y") +
+  theme_void() +
+  labs(title = "Work Experience Distribution")
+
+workex_bar <- ggplot(placement_filtered, aes(x = workex, fill = status)) +
+  geom_bar(position = "dodge", color = "black") +
+  theme_minimal() +
+  labs(title = "Influence of Work Experience on Placement", x = "Work Experience", y = "Count")
+
+grid.arrange(workex_pie, workex_bar, ncol = 2)
+
+# --- Boxplot & Swarmplot cho MBA Percentage theo Placement Status ---
+g_mba <- ggplot(placement_filtered, aes(y = factor(status), x = mba_p)) +
+  geom_boxplot(outlier.shape = NA, fill = "#2b8cbe", color = "black") +
+  geom_jitter(size = 2, width = 0.2, color = "black", alpha = 0.7) +
+  theme_minimal() +
+  labs(title = "MBA Percentage vs Placement Status", x = "Placement Status", y = "MBA Percentage")
+print(g_mba)
+
+# --- Scatter Plot với Facet theo Work Experience ---
+g_facet <- ggplot(placement_filtered, aes(x = mba_p, y = etest_p, color = status)) +
+  geom_point(alpha = 0.7) +
+  facet_wrap(~ workex) +
+  theme_minimal() +
+  labs(title = "Scatter Plot of MBA Percentage vs E-Test Percentage", x = "MBA Percentage", y = "E-Test Percentage")
+print(g_facet)
+
+# --- Violin Plot cho Salary theo Specialisation và Gender ---
+g_violin <- ggplot(placement_placed, aes(x = specialisation, y = salary, fill = gender)) +
+  geom_violin(trim = FALSE) +
+  geom_boxplot(width = 0.1, fill = "white", outlier.shape = NA) +
+  theme_minimal() +
+  labs(title = "Salary Distribution by Specialisation and Gender", x = "Specialisation", y = "Salary")
+print(g_violin)
+
+# --- Heatmap của ma trận tương quan ---
+
+cor_matrix <- round(cor(placement_placed %>% select_if(is.numeric)), 1)
+melted_cor <- melt(cor_matrix)
+g_heatmap <- ggplot(melted_cor, aes(Var1, Var2, fill = value)) +
+  geom_tile() +
+  geom_text(aes(label = value), color = "black") +
+  scale_fill_gradient(low = "white", high = "black") +
+  theme_minimal() +
+  labs(title = "Correlation Heatmap")
+print(g_heatmap)
+
+# --- Pairplot cho các biến số ---
+
+# Chuyển đổi cột 'status' thành factor
+placement_filtered$status <- as.factor(placement_filtered$status)
+g_pairplot <- ggpairs(placement_filtered, 
+                      columns = c("ssc_p", "hsc_p", "degree_p", "mba_p", "etest_p"), 
+                      mapping = aes(color = status))
+print(g_pairplot)
+
+#############################
+# 3. Xây dựng mô hình học máy với Spark ML
+#############################
+# Ví dụ: Huấn luyện mô hình Logistic Regression với các đặc trưng 'degree_p' và 'workex'
+ml_model <- placement_copy %>% 
+  ml_logistic_regression(response = "status", features = c("degree_p", "workex"))
+
+
+# Hiển thị kết quả mô hình
+print(ml_model)
+#############################
+# 4. Tạo biến Dummy và Tách dữ liệu cho Modeling
+#############################
+# Nếu placement_filtered đã là một data frame của R, chuyển lại sang Spark DataFrame:
+if (!inherits(placement_filtered, "tbl_spark")) {
+  placement_filtered <- copy_to(sc, placement_filtered, "placement_filtered", overwrite = TRUE)
+}
+
+# Sau đó, áp dụng các bước chuyển đổi dummy:
+placement_coded <- placement_filtered %>%
+  ft_string_indexer(input_col = "hsc_s", output_col = "hsc_s_index") %>%
+  ft_one_hot_encoder(input_col = "hsc_s_index", output_col = "dummy_hsc_s") %>%
+  ft_string_indexer(input_col = "degree_t", output_col = "degree_t_index") %>%
+  ft_one_hot_encoder(input_col = "degree_t_index", output_col = "dummy_degree_t") %>%
+  select(-hsc_s, -degree_t, -salary)
+
+# Giả sử các cột số khác của bạn là: "gender", "ssc_p", "hsc_p", "workex", "etest_p", "specialisation", "mba_p"
+# Và bạn có thêm 2 cột dummy: "dummy_hsc_s" và "dummy_degree_t" (dạng vector)
+
+# Kết hợp các cột số và cột dummy thành một vector features
+placement_coded <- placement_coded %>%
+  ft_vector_assembler(input_cols = c("ssc_p", "hsc_p", "workex", "etest_p",
+                                      "mba_p", "dummy_hsc_s", "dummy_degree_t"),
+                      output_col = "features")
+
+# Chia dữ liệu thành tập huấn luyện (80%) và tập test (20%) trên Spark
+splits <- sdf_random_split(placement_coded, training = 0.8, test = 0.2, seed = 1)
+train_tbl <- splits$training
+test_tbl  <- splits$test
+
+# Nếu cần thu thập dữ liệu về R để làm việc với các mô hình ngoài Spark (ví dụ: KNN hoặc XGBoost)
+placement_coded_df <- placement_coded %>% sdf_collect()
+
+# Tách X và y (ở đây y là cột 'status' đã có trong dữ liệu)
+X <- placement_coded_df %>% select(-status)
+y <- placement_coded_df$status
+
+# In kích thước của tập huấn luyện và tập test (ví dụ nếu dùng để modeling trên R)
+cat("Output Training approx. size:", round(nrow(placement_coded_df) * 0.8), "\n")
+cat("Output Test approx. size:", round(nrow(placement_coded_df) * 0.2), "\n")
+#############################
+# 5. Huấn luyện và đánh giá mô hình Học máy
+#############################
+
+# Giả sử rằng bạn đã có đối tượng Spark DataFrame 'placement_coded'
+# đã được tạo dummy cho các cột 'hsc_s' và 'degree_t', loại bỏ cột 'salary'
+# và chứa cột label 'status'. Hơn nữa, bạn đã định nghĩa biến đặc trưng (feature_cols)
+# và thực hiện vector hóa (ví dụ bằng ft_vector_assembler) nếu cần cho Spark ML.
+
+# 5.1 Chia dữ liệu thành tập huấn luyện và tập test trên Spark
+splits <- sdf_random_split(placement_coded, training = 0.8, test = 0.2, seed = 1)
+train_tbl <- splits$training
+test_tbl  <- splits$test
+
+#############################
+# 5.2 Logistic Regression (Spark ML) - Cập nhật nhãn
+#############################
+
+# Chuyển đổi cột 'status' (đang ở dạng string) sang dạng numeric bằng ft_string_indexer
+placement_coded <- placement_coded %>%
+  ft_string_indexer(input_col = "status", output_col = "status_index")
+
+# Chia dữ liệu thành tập huấn luyện (80%) và tập test (20%)
+splits <- sdf_random_split(placement_coded, training = 0.8, test = 0.2, seed = 1)
+train_tbl <- splits$training
+test_tbl  <- splits$test
+
+# Huấn luyện mô hình Logistic Regression sử dụng cột 'features' và nhãn 'status_index'
+log_reg_model <- ml_logistic_regression(train_tbl,
+                                        features_col = "features",
+                                        label_col = "status_index")
+
+# Dự đoán trên tập test
+predictions_lr <- ml_predict(log_reg_model, test_tbl)
+
+# Tính accuracy sử dụng evaluator của Spark ML (sử dụng cột 'status_index' làm nhãn)
+accuracy_lr <- ml_multiclass_classification_evaluator(predictions_lr,
+                                                      label_col = "status_index",
+                                                      prediction_col = "prediction",
+                                                      metric_name = "accuracy")
+print(paste("Accuracy of Logistic Regression on test set:", round(accuracy_lr, 2)))
+
+# Thu thập kết quả dự đoán về R để tính confusion matrix & báo cáo phân loại
+pred_lr <- predictions_lr %>% select(status_index, prediction, probability) %>% sdf_collect()
+
+# Tạo confusion matrix
+confusion_lr <- table(Predicted = pred_lr$prediction, Actual = pred_lr$status_index)
+print("Confusion Matrix (Logistic Regression):")
+print(confusion_lr)
+
+# Nếu cần báo cáo chi tiết, bạn có thể sử dụng package caret:
+
+cm_lr <- confusionMatrix(as.factor(pred_lr$prediction), as.factor(pred_lr$status_index))
+print("Classification Report (Logistic Regression):")
+print(cm_lr)
+
+# Vẽ ROC Curve:
+# Vì cột 'probability' là vector, ta lấy xác suất của lớp 1
+pred_lr$prob1 <- sapply(pred_lr$probability, function(x) x[2])
+
+roc_obj <- roc(pred_lr$status_index, pred_lr$prob1)
+auc_val <- auc(roc_obj)
+plot(roc_obj, main = sprintf("ROC Curve (AUC = %.2f)", auc_val))
+abline(a = 0, b = 1, col = "red", lty = 2)
+
+#############################
+# 5.3 Decision Tree Classifier (Spark ML)
+#############################
+
+# Huấn luyện mô hình Decision Tree sử dụng cột "features" và nhãn "status_index"
+dt_model <- ml_decision_tree(
+  train_tbl,
+  features_col = "features",
+  label_col = "status_index",  # sử dụng nhãn đã được chuyển đổi
+  max_depth = 3,
+  impurity = "gini"
+)
+
+# Dự đoán trên tập test
+predictions_dt <- ml_predict(dt_model, test_tbl)
+
+# Tính độ chính xác sử dụng evaluator của Spark ML
+accuracy_dt <- ml_multiclass_classification_evaluator(
+  predictions_dt,
+  label_col = "status_index",
+  prediction_col = "prediction",
+  metric_name = "accuracy"
+)
+print(paste("Decision Tree Accuracy:", round(accuracy_dt, 2)))
+
+# In thông tin mô hình để kiểm tra chi tiết
+print("Decision Tree Model Details:")
+print(dt_model)
+
+#############################
+# 5.4 Random Forest Classifier (Spark ML)
+#############################
+rf_model <- ml_random_forest(train_tbl,
+                             features_col = "features",
+                             label_col = "status",
+                             num_trees = 100)
+predictions_rf <- ml_predict(rf_model, test_tbl)
+accuracy_rf <- ml_multiclass_classification_evaluator(predictions_rf,
+                                                      label_col = "status",
+                                                      prediction_col = "prediction",
+                                                      metric_name = "accuracy")
+print(paste("Random Forest Accuracy:", round(accuracy_rf, 2)))
+
+# Vẽ biểu đồ Feature Importance
+rf_imp <- rf_model$feature_importances
+names(rf_imp) <- feature_cols
+rf_imp_df <- data.frame(feature = names(rf_imp),
+                        importance = as.numeric(rf_imp))
+ggplot(rf_imp_df, aes(x = reorder(feature, importance), y = importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  xlab("Features") +
+  ylab("Feature Importance Score") +
+  ggtitle("Visualizing Important Features (Random Forest)")
+
+# Nếu muốn huấn luyện mô hình Random Forest trên tập dữ liệu giảm (loại bỏ một số dummy)
+placement_coded_reduced <- placement_coded %>% select(-dummy_Comm&Mgmt, -dummy_Sci&Tech,
+                                                      -dummy_Science, -dummy_Commerce,
+                                                      -dummy_Arts, -dummy_Others)
+splits_reduced <- sdf_random_split(placement_coded_reduced, training = 0.8, test = 0.2, seed = 1)
+train_tbl2 <- splits_reduced$training
+test_tbl2  <- splits_reduced$test
+
+rf_model2 <- ml_random_forest(train_tbl2,
+                              features_col = "features",
+                              label_col = "status",
+                              num_trees = 100)
+predictions_rf2 <- ml_predict(rf_model2, test_tbl2)
+accuracy_rf2 <- ml_multiclass_classification_evaluator(predictions_rf2,
+                                                       label_col = "status",
+                                                       prediction_col = "prediction",
+                                                       metric_name = "accuracy")
+print(paste("Random Forest (reduced features) Accuracy:", round(accuracy_rf2, 2)))
+
+# Tính ROC cho Random Forest (reduced)
+pred_rf2 <- predictions_rf2 %>% select(status, probability) %>% sdf_collect()
+pred_rf2$prob1 <- sapply(pred_rf2$probability, function(x) x[2])
+roc_rf2 <- roc(pred_rf2$status, pred_rf2$prob1)
+auc_rf2 <- auc(roc_rf2)
+print(paste("Random Forest ROC AUC:", round(auc_rf2, 2)))
+
+#############################
+# 5.5 K-Nearest Neighbors (KNN) - thực hiện trên R
+#############################
+# Spark ML không hỗ trợ KNN trực tiếp; thu thập dữ liệu về R
+placement_coded_df <- placement_coded %>% sdf_collect()
+X_knn <- placement_coded_df %>% select(-status)
+y_knn <- placement_coded_df$status
+
+
+set.seed(1)
+trainIndex <- createDataPartition(y_knn, p = 0.8, list = FALSE)
+train_knn <- placement_coded_df[trainIndex, ]
+test_knn  <- placement_coded_df[-trainIndex, ]
+
+
+error_rate <- sapply(1:39, function(k) {
+  pred_knn <- knn(train = train_knn %>% select(-status),
+                  test = test_knn %>% select(-status),
+                  cl = train_knn$status,
+                  k = k)
+  mean(pred_knn != test_knn$status)
+})
+plot(1:39, error_rate, type = "b", col = "blue", pch = 19,
+     xlab = "K", ylab = "Error Rate", main = "Error Rate vs. K Value")
+
+# Với k = 5
+pred_knn5 <- knn(train = train_knn %>% select(-status),
+                 test = test_knn %>% select(-status),
+                 cl = train_knn$status,
+                 k = 5)
+cm_knn <- table(Predicted = pred_knn5, Actual = test_knn$status)
+print("KNN Confusion Matrix:")
+print(cm_knn)
+cm_knn_report <- confusionMatrix(as.factor(pred_knn5), as.factor(test_knn$status))
+print("KNN Classification Report:")
+print(cm_knn_report)
+
+#############################
+# 5.6 Naive Bayes (Spark ML - Bernoulli)
+#############################
+nb_model <- ml_naive_bayes(train_tbl,
+                           features_col = "features",
+                           label_col = "status",
+                           model_type = "bernoulli")
+predictions_nb <- ml_predict(nb_model, test_tbl)
+accuracy_nb <- ml_multiclass_classification_evaluator(predictions_nb,
+                                                      label_col = "status",
+                                                      prediction_col = "prediction",
+                                                      metric_name = "accuracy")
+print(paste("Naive Bayes Accuracy:", round(accuracy_nb, 2)))
+pred_nb <- predictions_nb %>% select(status, prediction) %>% sdf_collect()
+cm_nb <- table(Predicted = pred_nb$prediction, Actual = pred_nb$status)
+print("Naive Bayes Confusion Matrix:")
+print(cm_nb)
+
+#############################
+# 5.7 Support Vector Machine (SVM) - sử dụng ml_linear_svc
+#############################
+svm_model <- ml_linear_svc(train_tbl,
+                           features_col = "features",
+                           label_col = "status")
+predictions_svm <- ml_predict(svm_model, test_tbl)
+accuracy_svm <- ml_multiclass_classification_evaluator(predictions_svm,
+                                                       label_col = "status",
+                                                       prediction_col = "prediction",
+                                                       metric_name = "accuracy")
+print(paste("SVM Accuracy:", round(accuracy_svm, 2)))
+pred_svm <- predictions_svm %>% select(status, prediction) %>% sdf_collect()
+cm_svm <- table(Predicted = pred_svm$prediction, Actual = pred_svm$status)
+print("SVM Confusion Matrix:")
+print(cm_svm)
+
+#############################
+# 5.8 XGBoost (thực hiện trên R)
+#############################
+
+placement_coded_df <- placement_coded %>% sdf_collect()
+X_matrix <- as.matrix(placement_coded_df %>% select(-status))
+y_vector <- placement_coded_df$status
+
+set.seed(1)
+trainIndex_xgb <- createDataPartition(y_vector, p = 0.8, list = FALSE)
+X_train_xgb <- X_matrix[trainIndex_xgb, ]
+X_test_xgb  <- X_matrix[-trainIndex_xgb, ]
+y_train_xgb <- y_vector[trainIndex_xgb]
+y_test_xgb  <- y_vector[-trainIndex_xgb]
+
+xgb_model <- xgboost(data = X_train_xgb,
+                     label = y_train_xgb,
+                     objective = "binary:logistic",
+                     colsample_bytree = 0.3,
+                     learning_rate = 0.1,
+                     max_depth = 5,
+                     alpha = 10,
+                     nrounds = 10,
+                     verbose = 0)
+preds_xgb <- predict(xgb_model, X_test_xgb)
+rmse_xgb <- sqrt(mean((y_test_xgb - preds_xgb)^2))
+print(paste("XGBoost RMSE:", round(rmse_xgb, 4)))
+
+# Cross-validation với xgboost
+data_dmatrix <- xgb.DMatrix(data = X_matrix, label = y_vector)
+params <- list(objective = "binary:logistic",
+               colsample_bytree = 0.3,
+               learning_rate = 0.1,
+               max_depth = 5,
+               alpha = 10)
+cv_results <- xgb.cv(params = params,
+                     data = data_dmatrix,
+                     nfold = 3,
+                     nrounds = 50,
+                     early_stopping_rounds = 10,
+                     metrics = "rmse",
+                     verbose = 0,
+                     seed = 123)
+print("XGBoost CV - Test RMSE (last round):")
+print(tail(cv_results$evaluation_log$test_rmse_mean, 1))
